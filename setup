@@ -1,0 +1,136 @@
+#!/bin/bash
+
+
+output="/root/migration"
+ 
+if [ $# -lt 1 ] ; then
+    echo "$0 [newhost|import|init]"
+    exit 0;
+fi
+ 
+host="$1"
+if [ $# -lt 2 ]; then
+    dry=n
+else
+    dry=
+fi
+ 
+importaccounts () {
+    if [ $# -eq 0 ] ; then
+        importaccounts "$(cd /home/ && echo -n *)"
+        return
+    fi
+ 
+    for fname in $(find "$output/" -name "*.migrate" -printf "%f\n" | sed 's/.migrate$//' ) ; do
+        [ -f "$output/backup.$fname" ] || cp -av "/etc/$fname" "$output/backup.$fname"
+    #echo -n "$@"
+        echo "Writing to /etc/$fname"
+    echo -n "$@" | xargs -I{} -d' ' grep {} "$output/$fname.migrate" >> "/etc/$fname"
+    done
+}
+ 
+ 
+if [ "$host" == "import" ] ; then
+    # epel 7
+    rpm -i https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+     
+    ## INSTALL AJENTI
+    rpm -i http://repo.ajenti.org/ajenti-repo-1.0-1.noarch.rpm
+    yum install -y ajenti ajenti-v ajenti-v-mysql ajenti-v-php-fpm
+ 
+    #systemctl restart ajenti
+    echo ### DOES AJENTI WORK? FIX CENTOS 7.2 ISSUE WITH AJENTI
+    echo https://github.com/ajenti/ajenti/commit/9d09056c16fdcad5603fc3a0d7446865c5a21194
+    echo ###
+    echo ### REMEMBER TO SET AJENTI PASSWORD!
+    echo ###     
+    ## END INSTALL AJENTI
+     
+    # BEGIN LAMP STACK INSTALLATION PHP5.5
+    rpm -i https://mirror.webtatic.com/yum/el7/webtatic-release.rpm
+     
+    yum install -y yum-plugin-replace
+    yum replace -y --replace-with=php55w-common php70w-common 
+    yum install -y php55w php55w-fpm php55w-opcache httpd fail2ban mailx mariadb php55w-mysql mariadb-server mariadb
+    #END LAMP STACK
+     
+    ## MARIADB IMPORT from $output/mysql.tar.gz
+    systemctl stop mariadb
+    tar --overwrite -C / -xzvf "$output/mysql.tar.gz"
+    ## END MARIADB IMPORT
+ 
+    ## IMPORT USER ACCOUNTS
+    importaccounts
+    ## END IMPORT USER ACCOUNTS
+ 
+ 
+    ## IMPORT DATA DIRS
+    [ -f "$output/home.tar.gz" ] && tar --skip-old-files -C / -xzvf "$output/home.tar.gz"
+    [ -f "$output/mail.tar.gz" ] && tar -C / -xzvf "$output/mail.tar.gz"
+    ## END DATA DIRS IMPORT
+ 
+    ## BEGIN IMPORT http files
+    rsync -av "$output/httpd-conf.d/" /etc/httpd/conf.d/
+    for conf in $(find /etc/httpd/conf.d/) ; do
+            perl -i -p0e 's/order allow,deny.*?allow from all/Require all granted/is' "$conf"
+    done
+    ## END IMPORT http files
+ 
+    exit;
+fi
+ 
+if [ "$host" == "init" ] ; then
+    systemctl enable httpd
+    systemctl start httpd
+    systemctl enable fail2ban
+    systemctl start fail2ban
+    systemctl enable mariadb
+    systemctl start mariadb
+    systemctl restart crond
+    echo "System is online.."
+    exit;
+fi
+ 
+ 
+## BEGIN DATA MIGRATION..
+ 
+[ -d "$output/" ] || mkdir -v "$output"
+ 
+#  
+for f in passwd group shadow gshadow ; do
+    cp -pf "/etc/$f" "$output/$f.migrate"
+done
+ 
+cd /
+ 
+# home dirs
+    [ -f "$output/home.tar.gz" ] || tar -zcvpf "$output/home.tar.gz" /home
+# emails
+    [ -f "$output/mail.tar.gz" ] || tar -zcvpf "$output/mail.tar.gz" /var/spool/mail
+# mysql data
+if [ ! -f "$output/mysql.tar.gz" ] ; then
+    service mysqld stop
+    tar -zcvpf "$output/mysql.tar.gz" /var/lib/mysql
+    service mysqld start
+fi
+# http config
+    rsync -av /etc/httpd/conf.d/ "$output/httpd-conf.d/"
+     
+# transfer everything except tars
+    rsync -av$dry --exclude "*.tar.gz" "$output/" "$host:$output/"
+     
+# proceed to transfer tar files
+    rsync -a$dry --progress "$output/" "$host:$output/"
+     
+# transfer cron jobs
+    rsync -a$dry --ignore-existing "/var/spool/cron/" "$host:/var/spool/cron/"
+     
+# transfer fail2ban config
+    rsync -a$dry --ignore-existing "/etc/fail2ban/" "$host:/etc/fail2ban/"
+     
+# trigger import
+    echo "Now configuing remote system.."
+    ssh $host $output/migrate.sh import
+ 
+# start up services
+    ssh $host $output/migrate.sh init
